@@ -1,0 +1,922 @@
+import { fetchAssociations } from './api.js'
+
+// 节点和连线数据
+let nodes = []
+let edges = []
+let nodeIdCounter = 0
+let selectedNodes = new Set()
+let expandingNodes = new Set()
+
+// 撤销栈
+let undoStack = []
+
+// DOM 引用
+let graphLayer = null
+let svgLayer = null
+let transformContainer = null
+
+// 平移缩放状态
+let panX = 0
+let panY = 0
+let zoom = 1
+let isPanning = false
+let panStartX = 0
+let panStartY = 0
+let panStartPanX = 0
+let panStartPanY = 0
+
+// 拖拽状态
+let dragNode = null
+let dragOffsetX = 0
+let dragOffsetY = 0
+let dragMoved = false
+let dragStartClientX = 0
+let dragStartClientY = 0
+const DRAG_THRESHOLD = 6
+
+// 触摸状态
+let activePointers = new Map()
+let pinchStartDistance = 0
+let pinchStartZoom = 1
+let pinchStartWorld = null
+
+// 弹簧物理状态
+let springChildren = null // { parentId, children: [{id, relX, relY, curX, curY, el}] }
+let springFrameId = null
+let springSettling = false
+let lastDragNodeX = 0
+let lastDragNodeY = 0
+
+// 回调
+let onSelectionChange = null
+let onGraphChange = null
+
+// 确认按钮状态
+let confirmTarget = null
+
+function screenToWorld(sx, sy) {
+  return {
+    x: (sx - panX) / zoom,
+    y: (sy - panY) / zoom,
+  }
+}
+
+function applyTransform() {
+  transformContainer.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`
+  transformContainer.style.transformOrigin = '0 0'
+  window.dispatchEvent(new CustomEvent('graph:viewchange', {
+    detail: { zoom, pan: { x: panX, y: panY } },
+  }))
+}
+
+function clampZoom(value) {
+  return Math.min(Math.max(value, 0.2), 5)
+}
+
+function getPointerDistance(a, b) {
+  return Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY)
+}
+
+function getPointerMidpoint(a, b) {
+  return {
+    x: (a.clientX + b.clientX) / 2,
+    y: (a.clientY + b.clientY) / 2,
+  }
+}
+
+function resetPinchState() {
+  pinchStartDistance = 0
+  pinchStartWorld = null
+}
+
+function updatePointer(e) {
+  if (!activePointers.has(e.pointerId)) return
+  activePointers.set(e.pointerId, {
+    clientX: e.clientX,
+    clientY: e.clientY,
+  })
+}
+
+function beginPinchIfNeeded() {
+  if (activePointers.size < 2 || pinchStartDistance > 0) return
+  const [a, b] = [...activePointers.values()]
+  const midpoint = getPointerMidpoint(a, b)
+  pinchStartDistance = getPointerDistance(a, b)
+  pinchStartZoom = zoom
+  pinchStartWorld = screenToWorld(midpoint.x, midpoint.y)
+  isPanning = false
+  if (dragNode) {
+    dragNode.el.classList.remove('dragging')
+    dragNode = null
+    clearSpring()
+  }
+}
+
+function handlePinchZoom() {
+  if (activePointers.size < 2 || !pinchStartWorld || pinchStartDistance === 0) return false
+  const [a, b] = [...activePointers.values()]
+  const distance = getPointerDistance(a, b)
+  if (distance === 0) return true
+  const midpoint = getPointerMidpoint(a, b)
+  zoom = clampZoom(pinchStartZoom * (distance / pinchStartDistance))
+  panX = midpoint.x - pinchStartWorld.x * zoom
+  panY = midpoint.y - pinchStartWorld.y * zoom
+  applyTransform()
+  return true
+}
+
+function getAllDescendants(parentId) {
+  const result = []
+  const stack = [parentId]
+  while (stack.length > 0) {
+    const pid = stack.pop()
+    edges.forEach(e => {
+      if (e.from === pid) {
+        const child = nodes.find(n => n.id === e.to)
+        if (child) {
+          result.push(child)
+          stack.push(child.id)
+        }
+      }
+    })
+  }
+  return result
+}
+
+// ── 弹簧物理（带阻尼的拖尾跟随） ──
+
+function startSpring(draggedId) {
+  clearSpring()
+
+  const parent = nodes.find(n => n.id === draggedId)
+  if (!parent) return
+
+  const descendants = getAllDescendants(draggedId)
+  if (descendants.length === 0) return
+
+  const children = descendants.map((child, i) => {
+    const el = graphLayer.querySelector(`[data-id="${child.id}"]`)
+    if (!el) return null
+    el.style.animation = 'none'
+    el.classList.add('spring-active')
+
+    let depth = 0
+    let cur = child
+    while (cur.parentId && cur.parentId !== draggedId) {
+      cur = nodes.find(n => n.id === cur.parentId) || cur
+      depth++
+    }
+
+    const r1 = Math.random()
+    const r2 = Math.random()
+    const r3 = Math.random()
+    return {
+      id: child.id,
+      relX: child.x - parent.x,
+      relY: child.y - parent.y,
+      curX: child.x,
+      curY: child.y,
+      tailX: 0,
+      tailY: 0,
+      el,
+      depth,
+      // 每个节点独立的飘动参数
+      phase1: r1 * Math.PI * 2,
+      phase2: r2 * Math.PI * 2,
+      phase3: r3 * Math.PI * 2,
+      freq1: 0.002 + r1 * 0.002,
+      freq2: 0.003 + r2 * 0.002,
+      freq3: 0.001 + r3 * 0.0015,
+      amp1: 5 + depth * 3 + r1 * 5,
+      amp2: 3 + r2 * 4,
+      amp3: 2 + depth * 2 + r3 * 3,
+      tailStrength: 0.72 + Math.min(depth, 4) * 0.13 + r1 * 0.12,
+      tailDamping: 0.84 + r2 * 0.05,
+      tailEase: 0.15 + r3 * 0.04,
+      tailReturn: 0.9 + r2 * 0.04,
+      maxTail: 72 + depth * 14,
+    }
+  }).filter(Boolean)
+
+  if (children.length === 0) return
+
+  springChildren = { parentId: draggedId, children }
+  springSettling = false
+  lastDragNodeX = parent.x
+  lastDragNodeY = parent.y
+  requestSpringFrame()
+}
+
+function updateSpring() {
+  if (!springChildren) return true
+
+  const parent = nodes.find(n => n.id === springChildren.parentId)
+  if (!parent) return true
+
+  const t = performance.now()
+  const parentDeltaX = parent.x - lastDragNodeX
+  const parentDeltaY = parent.y - lastDragNodeY
+  lastDragNodeX = parent.x
+  lastDragNodeY = parent.y
+  let settled = true
+
+  springChildren.children.forEach(sc => {
+    const node = nodes.find(n => n.id === sc.id)
+    if (!node) return
+
+    // 目标：父节点当前位置 + 初始相对偏移
+    const targetX = parent.x + sc.relX
+    const targetY = parent.y + sc.relY
+
+    if (dragNode) {
+      sc.tailX = (sc.tailX - parentDeltaX * sc.tailStrength) * sc.tailDamping
+      sc.tailY = (sc.tailY - parentDeltaY * sc.tailStrength) * sc.tailDamping
+    } else {
+      sc.tailX *= sc.tailReturn
+      sc.tailY *= sc.tailReturn
+    }
+
+    const tailLength = Math.hypot(sc.tailX, sc.tailY)
+    if (tailLength > sc.maxTail) {
+      const ratio = sc.maxTail / tailLength
+      sc.tailX *= ratio
+      sc.tailY *= ratio
+    }
+
+    sc.curX += (targetX + sc.tailX - sc.curX) * sc.tailEase
+    sc.curY += (targetY + sc.tailY - sc.curY) * sc.tailEase
+
+    const driftScale = dragNode ? 0.3 : 0.2
+    const driftX = (Math.sin(t * sc.freq1 + sc.phase1) * sc.amp1
+                  + Math.sin(t * sc.freq3 + sc.phase3) * sc.amp3) * driftScale
+    const driftY = (Math.cos(t * sc.freq2 + sc.phase2) * sc.amp2
+                  + Math.cos(t * sc.freq3 * 1.4 + sc.phase3) * sc.amp3) * driftScale
+
+    node.x = sc.curX + driftX
+    node.y = sc.curY + driftY
+    sc.displayX = node.x
+    sc.displayY = node.y
+    updateNodePosition(node)
+
+    const distance = Math.hypot(targetX - sc.curX, targetY - sc.curY)
+    const tail = Math.hypot(sc.tailX, sc.tailY)
+    if (distance > 0.7 || tail > 0.7) settled = false
+  })
+
+  renderEdges()
+  return settled
+}
+
+function requestSpringFrame() {
+  if (springFrameId) return
+  springFrameId = requestAnimationFrame(runSpringFrame)
+}
+
+function runSpringFrame() {
+  springFrameId = null
+  if (!springChildren) return
+  const settled = updateSpring()
+  if (dragNode || !springSettling || !settled) {
+    requestSpringFrame()
+    return
+  }
+  commitSpring()
+}
+
+function commitSpring() {
+  if (!springChildren) return
+  springChildren.children.forEach(sc => {
+    const node = nodes.find(n => n.id === sc.id)
+    if (node) {
+      node.x = sc.displayX ?? sc.curX
+      node.y = sc.displayY ?? sc.curY
+    }
+    sc.el.style.animation = ''
+    sc.el.classList.remove('spring-active')
+    if (node) updateNodePosition(node)
+  })
+  springChildren = null
+  springSettling = false
+  if (onGraphChange) onGraphChange()
+}
+
+function clearSpring() {
+  if (springFrameId) {
+    cancelAnimationFrame(springFrameId)
+    springFrameId = null
+  }
+  if (springChildren) {
+    springChildren.children.forEach(sc => {
+      const node = nodes.find(n => n.id === sc.id)
+      sc.el.style.animation = ''
+      sc.el.classList.remove('spring-active')
+      if (node) updateNodePosition(node)
+    })
+    springChildren = null
+  }
+  springSettling = false
+}
+
+// ── 事件处理 ──
+
+function moveInteraction(clientX, clientY) {
+  if (isPanning) {
+    panX = panStartPanX + (clientX - panStartX)
+    panY = panStartPanY + (clientY - panStartY)
+    applyTransform()
+    return
+  }
+
+  if (!dragNode) return
+  const { node, el } = dragNode
+  if (!dragMoved) {
+    const moved = Math.hypot(clientX - dragStartClientX, clientY - dragStartClientY)
+    if (moved < DRAG_THRESHOLD) return
+    dragMoved = true
+  }
+  const world = screenToWorld(clientX, clientY)
+  node.x = world.x - dragOffsetX
+  node.y = world.y - dragOffsetY
+  el.style.left = `${node.x - el.offsetWidth / 2}px`
+  el.style.top = `${node.y - el.offsetHeight / 2}px`
+
+  // 启动弹簧（首次拖拽时）
+  if (!springChildren || springChildren.parentId !== node.id) {
+    startSpring(node.id)
+  }
+  requestSpringFrame()
+
+  renderEdges()
+}
+
+function endInteraction() {
+  if (isPanning) {
+    isPanning = false
+    document.body.style.cursor = ''
+    return
+  }
+  if (dragNode) {
+    dragNode.el.classList.remove('dragging')
+    dragNode = null
+    if (springChildren) {
+      springSettling = true
+      requestSpringFrame()
+    }
+  }
+}
+
+function shouldIgnoreCanvasTarget(target) {
+  return target.closest('.input-area, .canvas-controls, .theme-toggle, .history-btn, .history-drawer, .generate-btn, .result-modal, .selection-badge, .overlay, .global-loading')
+}
+
+function onPointerMove(e) {
+  updatePointer(e)
+  if (activePointers.size >= 2) {
+    e.preventDefault()
+    beginPinchIfNeeded()
+    if (handlePinchZoom()) return
+  }
+  moveInteraction(e.clientX, e.clientY)
+}
+
+function onPointerUp(e) {
+  activePointers.delete(e.pointerId)
+  if (activePointers.size < 2) resetPinchState()
+  endInteraction()
+}
+
+// ── 初始化 ──
+
+export function initGraph(graphEl, svgEl, transformEl, onSelChange, onGraphUpdate) {
+  graphLayer = graphEl
+  svgLayer = svgEl
+  transformContainer = transformEl
+  onSelectionChange = onSelChange
+  onGraphChange = onGraphUpdate
+
+  // 画布事件绑定在 document，用排除法过滤 UI 控件和节点
+  document.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return
+    if (shouldIgnoreCanvasTarget(e.target)) return
+    if (e.target.closest('.node')) return
+
+    removeConfirmIcon()
+    activePointers.set(e.pointerId, {
+      clientX: e.clientX,
+      clientY: e.clientY,
+    })
+    beginPinchIfNeeded()
+    if (activePointers.size >= 2) {
+      e.preventDefault()
+      return
+    }
+
+    isPanning = true
+    panStartX = e.clientX
+    panStartY = e.clientY
+    panStartPanX = panX
+    panStartPanY = panY
+    document.body.style.cursor = 'grabbing'
+    e.preventDefault()
+  }, { capture: true })
+
+  document.addEventListener('wheel', (e) => {
+    if (e.target.closest('.input-area, .canvas-controls, .history-drawer, .result-modal, .generate-btn')) return
+    e.preventDefault()
+    const delta = e.deltaY > 0 ? 0.92 : 1.08
+    const newZoom = clampZoom(zoom * delta)
+    const mx = e.clientX
+    const my = e.clientY
+    panX = mx - (mx - panX) * (newZoom / zoom)
+    panY = my - (my - panY) * (newZoom / zoom)
+    zoom = newZoom
+    applyTransform()
+  }, { passive: false })
+
+  document.addEventListener('pointermove', onPointerMove, { passive: false })
+  document.addEventListener('pointerup', onPointerUp)
+  document.addEventListener('pointercancel', onPointerUp)
+  window.addEventListener('resize', () => renderEdges())
+
+  document.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
+      e.preventDefault()
+      undo()
+    }
+  })
+}
+
+// ── 导出 API ──
+
+export function getSelectedNodes() {
+  return nodes.filter(n => selectedNodes.has(n.id))
+}
+
+const APPEND_CLUSTER_GAP = 520
+const CHILDREN_PER_RING = 8
+const FIRST_CHILD_RING_RADIUS = 180
+const CHILD_RING_GAP = 110
+
+export function chooseAppendRootPosition(existingNodes, gap = APPEND_CLUSTER_GAP) {
+  if (existingNodes.length === 0) {
+    return { x: 0, y: 0 }
+  }
+  const maxX = Math.max(...existingNodes.map(n => n.x))
+  const minY = Math.min(...existingNodes.map(n => n.y))
+  const maxY = Math.max(...existingNodes.map(n => n.y))
+  return {
+    x: maxX + gap,
+    y: (minY + maxY) / 2,
+  }
+}
+
+export function addRootNode(word, options = {}) {
+  const append = options.append && nodes.length > 0
+  const position = append
+    ? chooseAppendRootPosition(nodes)
+    : {
+        x: (window.innerWidth / 2 - panX) / zoom,
+        y: (window.innerHeight / 2 - panY) / zoom,
+      }
+  const cx = position.x
+  const cy = position.y
+  const node = createNodeData(word, cx, cy, null, true)
+  nodes.push(node)
+  renderNode(node)
+  if (onGraphChange) onGraphChange()
+  return node
+}
+
+export function arrangeChildrenAroundParent(parent, childNodes) {
+  childNodes.forEach((node, i) => {
+    const ring = Math.floor(i / CHILDREN_PER_RING)
+    const ringStart = ring * CHILDREN_PER_RING
+    const itemsInRing = Math.min(CHILDREN_PER_RING, childNodes.length - ringStart)
+    const indexInRing = i - ringStart
+    const radius = FIRST_CHILD_RING_RADIUS + ring * CHILD_RING_GAP
+    const angle = -Math.PI / 2 + (2 * Math.PI * indexInRing) / itemsInRing
+
+    node.x = parent.x + Math.cos(angle) * radius
+    node.y = parent.y + Math.sin(angle) * radius
+  })
+}
+
+function collectDescendantsFrom(nodeId, allNodes, allEdges) {
+  const result = []
+  const stack = [nodeId]
+  while (stack.length > 0) {
+    const parent = stack.pop()
+    allEdges.forEach(edge => {
+      if (edge.from !== parent) return
+      const child = allNodes.find(n => n.id === edge.to)
+      if (!child) return
+      result.push(child)
+      stack.push(child.id)
+    })
+  }
+  return result
+}
+
+export function moveNodeTree(node, targetX, targetY, allNodes, allEdges) {
+  const dx = targetX - node.x
+  const dy = targetY - node.y
+  node.x = targetX
+  node.y = targetY
+  collectDescendantsFrom(node.id, allNodes, allEdges).forEach(descendant => {
+    descendant.x += dx
+    descendant.y += dy
+  })
+}
+
+export function expandNode(parentId, words) {
+  const parent = nodes.find(n => n.id === parentId)
+  if (!parent) return
+
+  words = words.filter(w => !nodes.some(n => n.zh === w.zh))
+  if (words.length === 0) return
+
+  const newNodes = []
+
+  words.forEach((word) => {
+    const node = createNodeData(word, parent.x, parent.y, parentId, false)
+    nodes.push(node)
+    newNodes.push(node)
+    edges.push({ from: parentId, to: node.id })
+  })
+
+  const directChildren = nodes.filter(n => n.parentId === parentId)
+  const arrangedChildren = directChildren.map(n => ({ ...n }))
+  arrangeChildrenAroundParent(parent, arrangedChildren)
+  directChildren.forEach((node, i) => {
+    moveNodeTree(node, arrangedChildren[i].x, arrangedChildren[i].y, nodes, edges)
+  })
+
+  newNodes.forEach(node => {
+    renderNode(node)
+  })
+  directChildren.forEach(node => {
+    if (newNodes.includes(node)) return
+    updateNodeTreePosition(node)
+  })
+
+  undoStack.push({
+    nodeIds: newNodes.map(n => n.id),
+    parentId: parentId,
+  })
+
+  renderEdges()
+  if (onGraphChange) onGraphChange()
+}
+
+function createNodeData(word, x, y, parentId, isRoot) {
+  return {
+    id: ++nodeIdCounter,
+    zh: word.zh,
+    en: word.en,
+    x, y, parentId, isRoot,
+    collapsed: false,
+    floatClass: `floating-${(Math.floor(Math.random() * 3)) + 1}`,
+  }
+}
+
+function renderNode(node) {
+  const el = document.createElement('div')
+  el.className = `node ${node.floatClass}${node.isRoot ? ' large root-node' : ''} entering`
+  el.dataset.id = node.id
+
+  el.innerHTML = `
+    <span class="zh">${node.zh}</span>
+    <span class="en">${node.en}</span>
+  `
+
+  const size = node.isRoot ? 120 : 90
+  el.style.left = `${node.x - size / 2}px`
+  el.style.top = `${node.y - size / 2}px`
+  el.style.width = `${size}px`
+  el.style.height = `${size}px`
+
+  el.title = node.zh + (node.en ? ` (${node.en})` : '')
+
+  el.addEventListener('click', () => {
+    if (dragMoved) return
+    showConfirmIcon(node, el)
+  })
+
+  el.addEventListener('contextmenu', (e) => {
+    e.preventDefault()
+    toggleSelection(node, el)
+  })
+
+  el.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return
+    if (expandingNodes.has(node.id)) return
+    e.stopPropagation()
+    activePointers.set(e.pointerId, {
+      clientX: e.clientX,
+      clientY: e.clientY,
+    })
+    beginPinchIfNeeded()
+    if (activePointers.size >= 2) {
+      e.preventDefault()
+      return
+    }
+
+    el.setPointerCapture(e.pointerId)
+    const world = screenToWorld(e.clientX, e.clientY)
+    dragNode = { node, el }
+    dragStartClientX = e.clientX
+    dragStartClientY = e.clientY
+    dragOffsetX = world.x - node.x
+    dragOffsetY = world.y - node.y
+    dragMoved = false
+    el.classList.add('dragging')
+  })
+
+  graphLayer.appendChild(el)
+
+  el.addEventListener('animationend', () => {
+    el.classList.remove('entering')
+  }, { once: true })
+}
+
+function renderEdges() {
+  svgLayer.innerHTML = ''
+  const visibleIds = new Set(nodes.filter(n => !isHidden(n.id)).map(n => n.id))
+
+  edges.forEach(edge => {
+    const from = nodes.find(n => n.id === edge.from)
+    const to = nodes.find(n => n.id === edge.to)
+    if (!from || !to) return
+    if (!visibleIds.has(from.id) || !visibleIds.has(to.id)) return
+
+    const dx = to.x - from.x
+    const dy = to.y - from.y
+    const dist = Math.hypot(dx, dy)
+    if (dist < 1) return
+
+    const ux = dx / dist
+    const uy = dy / dist
+    const fromRadius = from.isRoot ? 64 : 49
+    const toRadius = to.isRoot ? 64 : 49
+    const startX = from.x + ux * fromRadius
+    const startY = from.y + uy * fromRadius
+    const endX = to.x - ux * toRadius
+    const endY = to.y - uy * toRadius
+    if (Math.hypot(endX - startX, endY - startY) < 8) return
+
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path')
+    path.setAttribute('d', `M ${startX} ${startY} L ${endX} ${endY}`)
+    svgLayer.appendChild(path)
+  })
+}
+
+function isHidden(nodeId) {
+  let current = nodes.find(n => n.id === nodeId)
+  while (current && current.parentId) {
+    const parent = nodes.find(n => n.id === current.parentId)
+    if (parent && parent.collapsed) return true
+    current = parent
+  }
+  return false
+}
+
+function updateNodePosition(node) {
+  const el = graphLayer.querySelector(`[data-id="${node.id}"]`)
+  if (!el) return
+  el.style.left = `${node.x - el.offsetWidth / 2}px`
+  el.style.top = `${node.y - el.offsetHeight / 2}px`
+}
+
+function updateNodeTreePosition(node) {
+  updateNodePosition(node)
+  getAllDescendants(node.id).forEach(updateNodePosition)
+}
+
+function showConfirmIcon(node, nodeEl) {
+  if (confirmTarget && confirmTarget.el === nodeEl) {
+    removeConfirmIcon()
+    return
+  }
+  removeConfirmIcon()
+
+  const icon = document.createElement('div')
+  icon.className = 'confirm-icon'
+  icon.title = '点击展开联想'
+
+  icon.addEventListener('pointerdown', (e) => {
+    e.preventDefault()
+    e.stopPropagation()
+  })
+
+  icon.addEventListener('click', (e) => {
+    e.preventDefault()
+    e.stopPropagation()
+    removeConfirmIcon()
+    handleNodeExpand(node, nodeEl)
+  })
+
+  nodeEl.appendChild(icon)
+  confirmTarget = { node, el: nodeEl, icon }
+
+  setTimeout(() => {
+    document.addEventListener('mousedown', onDocDismissConfirm, { once: true })
+  }, 0)
+}
+
+function onDocDismissConfirm(e) {
+  if (confirmTarget && !confirmTarget.el.contains(e.target)) {
+    removeConfirmIcon()
+  } else if (confirmTarget) {
+    document.addEventListener('mousedown', onDocDismissConfirm, { once: true })
+  }
+}
+
+function removeConfirmIcon() {
+  if (confirmTarget) {
+    confirmTarget.icon.remove()
+    confirmTarget = null
+  }
+}
+
+async function handleNodeExpand(node, nodeEl) {
+  if (nodeEl.querySelector('.loader')) return
+
+  expandingNodes.add(node.id)
+  nodeEl.classList.add('expanding')
+  const loader = document.createElement('div')
+  loader.className = 'loader'
+  nodeEl.appendChild(loader)
+
+  try {
+    const existing = nodes.map(n => n.zh)
+    const words = await fetchAssociations(node.zh, existing)
+    expandNode(node.id, words)
+    updateNodeBadge(node)
+  } catch (err) {
+    console.error('联想失败:', err)
+    alert(err.message || '联想失败，请稍后重试')
+  } finally {
+    expandingNodes.delete(node.id)
+    nodeEl.classList.remove('expanding')
+    loader.remove()
+  }
+}
+
+function updateNodeBadge(node) {
+  const el = graphLayer.querySelector(`[data-id="${node.id}"]`)
+  if (!el) return
+  let badge = el.querySelector('.node-badge')
+  const childCount = edges.filter(e => e.from === node.id).length
+  if (childCount === 0) {
+    if (badge) badge.remove()
+    return
+  }
+  if (!badge) {
+    badge = document.createElement('span')
+    badge.className = 'node-badge'
+    badge.addEventListener('click', (e) => {
+      e.stopPropagation()
+      toggleCollapse(node)
+    })
+    el.appendChild(badge)
+  }
+  badge.textContent = node.collapsed ? childCount + ' ▸' : childCount
+  badge.classList.toggle('collapsed', node.collapsed)
+}
+
+function updateCollapseState() {
+  nodes.forEach(node => {
+    const el = graphLayer.querySelector(`[data-id="${node.id}"]`)
+    if (!el) return
+    el.classList.toggle('hidden', isHidden(node.id))
+  })
+  renderEdges()
+}
+
+function toggleCollapse(node) {
+  const childCount = edges.filter(e => e.from === node.id).length
+  if (childCount === 0) return
+  node.collapsed = !node.collapsed
+  updateCollapseState()
+  updateNodeBadge(node)
+  if (onGraphChange) onGraphChange()
+}
+
+function toggleSelection(node, el) {
+  if (selectedNodes.has(node.id)) {
+    selectedNodes.delete(node.id)
+    el.classList.remove('selected')
+  } else {
+    selectedNodes.add(node.id)
+    el.classList.add('selected')
+  }
+  if (onSelectionChange) onSelectionChange(getSelectedNodes())
+}
+
+export function getZoom() { return zoom }
+export function getPan() { return { x: panX, y: panY } }
+
+export function setZoom(newZoom, cx, cy) {
+  const rect = transformContainer.getBoundingClientRect()
+  const mx = cx ?? rect.width / 2
+  const my = cy ?? rect.height / 2
+  const clamped = Math.min(Math.max(newZoom, 0.2), 5)
+  panX = mx - (mx - panX) * (clamped / zoom)
+  panY = my - (my - panY) * (clamped / zoom)
+  zoom = clamped
+  applyTransform()
+}
+
+export function setPan(x, y) {
+  panX = x
+  panY = y
+  applyTransform()
+}
+
+export function fitToView() {
+  if (nodes.length === 0) {
+    panX = 0; panY = 0; zoom = 1
+    applyTransform()
+    return
+  }
+  const minX = Math.min(...nodes.map(n => n.x)) - 120
+  const maxX = Math.max(...nodes.map(n => n.x)) + 120
+  const minY = Math.min(...nodes.map(n => n.y)) - 120
+  const maxY = Math.max(...nodes.map(n => n.y)) + 120
+  const worldW = maxX - minX
+  const worldH = maxY - minY
+  const screenW = window.innerWidth
+  const screenH = window.innerHeight
+  zoom = Math.min(screenW / worldW, screenH / worldH, 2)
+  panX = (screenW - worldW * zoom) / 2 - minX * zoom
+  panY = (screenH - worldH * zoom) / 2 - minY * zoom
+  applyTransform()
+}
+
+export function resetView() {
+  panX = 0; panY = 0; zoom = 1
+  applyTransform()
+}
+
+export function exportGraphState() {
+  return {
+    nodes: nodes.map(n => ({ ...n })),
+    edges: edges.map(e => ({ ...e })),
+    nodeIdCounter,
+  }
+}
+
+export function importGraphState(state) {
+  clearGraph()
+  if (!state) return
+  nodeIdCounter = state.nodeIdCounter || 0
+  state.edges.forEach(e => edges.push({ ...e }))
+  state.nodes.forEach(n => {
+    nodes.push(n)
+    renderNode(n)
+    updateNodeBadge(n)
+  })
+  renderEdges()
+}
+
+export function clearGraph() {
+  removeConfirmIcon()
+  clearSpring()
+  nodes = []
+  edges = []
+  selectedNodes.clear()
+  expandingNodes.clear()
+  undoStack = []
+  nodeIdCounter = 0
+  graphLayer.innerHTML = ''
+  svgLayer.innerHTML = ''
+  if (onSelectionChange) onSelectionChange([])
+}
+
+export function undo() {
+  if (undoStack.length === 0) return
+
+  const action = undoStack.pop()
+  removeConfirmIcon()
+
+  edges = edges.filter(e => !action.nodeIds.includes(e.to))
+
+  action.nodeIds.forEach(id => {
+    const idx = nodes.findIndex(n => n.id === id)
+    if (idx !== -1) nodes.splice(idx, 1)
+    const el = graphLayer.querySelector(`[data-id="${id}"]`)
+    if (el) el.remove()
+    selectedNodes.delete(id)
+  })
+
+  const parentNode = nodes.find(n => n.id === action.parentId)
+  if (parentNode) {
+    const remaining = edges.filter(e => e.from === parentNode.id).length
+    if (remaining === 0) parentNode.collapsed = false
+    updateNodeBadge(parentNode)
+  }
+
+  renderEdges()
+  if (onSelectionChange) onSelectionChange(getSelectedNodes())
+  if (onGraphChange) onGraphChange()
+}
